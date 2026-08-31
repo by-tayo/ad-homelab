@@ -1,107 +1,75 @@
-# Active Directory Home Lab
+# Enterprise Network Simulation
 
-## ✍️ Introduction
+A segmented, AD-authenticated enterprise range built as a hands-on purple-team practice environment. Active Directory at the core, pfSense doing real routing and VLAN segmentation around it, TrueNAS and Splunk providing storage and detection, and Kali/BloodHound driving attack simulation against it — all virtualized, all documented as it was built.
 
-This project is to build an Active Directory Home Lab 
-which will then be utilized to create a corporate network simulation 
-with security practices.
+> Started as a single-domain Active Directory homelab. Expanded into a routed, segmented, monitored range once pfSense, TrueNAS, Splunk, and remote access got layered on.
 
-## 🛠️ Tools Used
+## Overview
 
----
+| | |
+|---|---|
+| **Domain** | `corp.lab` |
+| **Hypervisor** | VMware Workstation (Proxmox VE planned — see [Roadmap](#roadmap)) |
+| **Router / Firewall** | pfSense CE |
+| **Directory Services** | Active Directory Domain Services, DNS, Group Policy |
+| **Storage** | TrueNAS SCALE, domain-joined, AD-group-scoped NFSv4 ACLs |
+| **Detection** | Splunk Enterprise + Universal Forwarder, Sysmon (SwiftOnSecurity) |
+| **Offense** | Kali Linux, BloodHound CE, Impacket, Hashcat |
+| **Remote Access** | OpenVPN, LDAP-authenticated against `corp.lab` |
 
-- VMWare Workstation Pro17
-- PowerShell
-- Windows 11
-- Windows Server 2022
+## Architecture
 
----
+![Enterprise Network Simulation topology](docs/architecture.png)
 
-![Home Page](images/windows_home_page.png)
-I configured Windows Server 2022 as my Domain Controller (DC) and this will be utilized as the Default Gateway for the two NICs.
+pfSense sits between the internet-facing WAN and three routed segments: a trusted LAN carrying the AD homelab hosts, a client VLAN with internet-only access, and a fully isolated VLAN reserved for red-team work. A remote OpenVPN client authenticates against `corp.lab` AD before it's routed into the LAN.
 
-![Network Connections](images/network_connections.png)
-I Included two Network Adapters, one is to attach to NAT 
-(Internet) and other one is to the Internal Network (Isolated).  I then 
-configured the Internal Network to set up the IP address, subnet mask, 
-and DNS.
+| Interface | Segment | Subnet | DHCP Range | Policy |
+|---|---|---|---|---|
+| `em0` | WAN | — | — | NAT uplink to internet |
+| `em1` | LAN | `192.168.125.0/24` | static hosts | Trusted — AD core, full access |
+| `em2` · OPT1 | VLAN_CLIENTS | `192.168.20.0/24` | `.100`–`.200` | Internet only — blocked from LAN & Red Team |
+| `em3` · OPT2 | VLAN_REDTEAM | `192.168.30.0/24` | `.100`–`.200` | Isolated — zero pass rules, reserved for future red-team use |
+| `ovpns1` | OpenVPN | `10.10.10.0/24` (tunnel) | — | AD/LDAP-authenticated, routes to LAN |
 
-![AD DS](images/ad_ds.png)
-Next, I Installed AD DS (Active Directory Domain Services) and created a domain.
+| Host | Role |
+|---|---|
+| `DC01` | Domain controller — AD DS, DNS |
+| `CLIENT01` | Windows 11 workstation, domain-joined |
+| `STORAGE01` | TrueNAS SCALE — AD-joined SMB storage |
+| `LOGSRV` | Splunk Enterprise — SIEM / log aggregation |
+| Kali | Attacker workstation — BloodHound, Impacket, Hashcat |
 
-![Local Domain](images/local_server_domain.png)
+## What's built
 
-I went to the Local Server to see my Domain being listed on the Properties section.
+**Active Directory core** — `corp.lab` domain with an OU tree across 8 departments, 1,050 provisioned user accounts, help-desk delegation, and GPOs enforcing a logon banner, a UNC-based wallpaper policy (loopback processing, merge mode), and a Control Panel/Settings restriction — all verified against `CLIENT01` after `gpupdate /force`.
 
-![Domain Admin](/images/domain_admin.png)
+**Centralized logging** — Sysmon (SwiftOnSecurity config) on `DC01` and `CLIENT01`, forwarded through Splunk Universal Forwarder into Splunk Enterprise on `LOGSRV`. TrueNAS syslog forwards over UDP `5514`.
 
-I went ahead and got into the Windows Administrative Tools
- then into Active Directory Users and Computers to create a domain admin
- account.
+**AD-integrated storage** — `STORAGE01` (TrueNAS SCALE) domain-joined via Kerberos credentials, serving an SMB share with an NFSv4 ACL scoped to the `CORP\operations-staff` AD group — verified by a non-admin domain user writing to the share and an admin account *without* group membership being correctly denied, over both LAN and VPN.
 
-![RAS](/images/ras.png)
+**pfSense migration & OpenVPN remote access** — pfSense CE installed in front of the lab as the router/firewall. Remote access via OpenVPN, authenticating against `corp.lab` AD over LDAP (UPN-format bind DN), split-tunneled to route only `192.168.125.0/24`. Verified end-to-end: routed ping, pfSense LAN UI, and an authenticated SMB mount over the tunnel (after chasing down a WAN private-network block and an MTU/fragmentation issue with `tun-mtu 1400; mssfix 1360`).
 
-Next, I installed and configured RAS (Remote Access 
-Server) with NAT (Network Address Translation). This will be utilized 
-for the Windows 11 client to be in a private-virtual network, but still 
-be able to access the Internet through the DC.
+**VLAN segmentation** *(in progress)* — Two new interfaces off pfSense: `VLAN_CLIENTS` (internet access, blocked from LAN and from Red Team) and `VLAN_REDTEAM` (fully isolated, no pass rules, DHCP-only) — each with its own scope and firewall policy.
 
-![DHCP Server](/images/dhcp_server.png)
+**Attack simulation, closed-loop to detection** — From Kali: `bloodhound-ce-python` enumeration over LDAP as a low-privilege user (1,030 users, 61 groups, 34 OUs collected), a clean baseline confirmed (no path to Domain Admins, no Kerberoastable accounts), then a deliberately weak service account (`svc_sql`, SPN-registered) introduced and attacked with `impacket-GetUserSPNs` and cracked offline with Hashcat. The attack showed up in Splunk on the first query — `EventCode=4769`, exact account and source IP — closing the loop from offense to detection on the existing Sysmon + Splunk pipeline with no new instrumentation.
 
-Next, I installed DHCP Server for the Windows 11 client to
- get an IP address which will give it access to the Internet meanwhile, 
-it's in a private-internal network.
+## Roadmap
 
----
+| # | Step | Status |
+|---|---|---|
+| 01 | VLAN Segmentation | In progress |
+| 02 | Suricata IDS/IPS | Planned |
+| 03 | Reverse Proxy | Planned |
+| 04 | OSPF Dynamic Routing | Planned |
+| 05 | Multi-WAN Failover | Planned |
+| 06 | Physical Hardware Expansion | Planned |
 
-## 📁 Files
+Step 06 moves part of the range off virtual switches: a Proxmox VE laptop for persistent services (Splunk, TrueNAS, a secondary DC) and a second physical laptop as a domain-joined endpoint that can also boot live for rogue-device testing — bridged through a real managed switch, which is what finally allows genuine 802.1Q VLAN trunking (VMware Workstation's virtual switches don't support it).
 
-- `1_CREATE_USERS.ps1` - I downloaded a custom powershell
-script to create a list of users. I then edited the powershell script to implement password security.
-- `names.txt` - Over (+1000 users) in the text file to use for the AD Lab.
+## Documentation
 
----
-
-![PowerShell Script](/images/powershell_script.png)
-
-I utilize the command Set-ExecutionPolicy Unrestricted to 
-be able to run PowerShell scripts that are downloaded from the Internet.
- I then switched directories and executed the PowerShell script.
-
-![Users Created](/images/users_created.png)
-
-As we see, the custom PowerShell script created (+1000) users for the AD Lab.
-
-![Background](/images/background.png)
-
-For Windows 11 to be in a private-internal network, it 
-needs to be bypassed through the network settings and act as an Internal
- NIC. The Client is going to obtain the IP address from the DHCP Server 
-I've configured.
-
-![Router](/images/router.png)
-
-As the Client doesn't have a default gateway I included a Router through the DHCP Server Options and a loopback address.
-
-![Windows 11 Client](/images/windows_11_client.png)
-
-I then configured my Windows 11 Client for it to be a 
-member of mydomain.com. We can verify this through the Address Leases on
- my Domain Controller.
-
-![Verify Domain](/images/verify_domain.png)
-
-Finally, I logged in to my Client through the domain, MYDOMAIN and verified I am in.
+Full build walkthroughs, including every troubleshooting step and the exact fixes for each issue hit along the way, are written up as part of the project docs — TrueNAS AD storage build, and the pfSense OpenVPN + AD remote access build, with more added as each roadmap step lands.
 
 ---
 
-## Conclusion
-
-As I completed the setup of my Active Directory Home Lab 
-using the various tools listed and obtaining over a thousand users, I am
- ready to create a corporate network simulation to implement security 
-strategies.
-
-## Source
-
-Josh Madakor, Youtuber in the cybersecurity/information technology field.
+Built and documented by TAYO.
